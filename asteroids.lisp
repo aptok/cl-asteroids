@@ -1,27 +1,41 @@
 (require 'magicl)
 (require 'local-time)
+(require 'trivial-download)
+
+;; useful stuff
+(defparameter *rad* (/ pi 180))
+(defparameter *deg* (/ 180 pi))
+(defun parse-float (string)
+  "Return a float read from string, and the index to the remainder of string.
+   Stolen from Peter Norvig"
+  (multiple-value-bind (integer i)
+      (parse-integer string :junk-allowed t)
+    (multiple-value-bind (fraction j)
+	(parse-integer string :start (+ i 1) :junk-allowed t)
+      (values (float (+ integer (/ fraction (expt 10d0 (- j i 1))))) j))))
 
 ;; orbital elements of small bodies downloaded from
 ;; https://ssd.jpl.nasa.gov/dat/ELEMENTS.NUMBR and
 ;; https://ssd.jpl.nasa.gov/dat/ELEMENTS.UNNUM
-(defparameter *elements-unnumbered-file* "ELEMENTS.UNNUM-small")
-(defparameter *elements-numbered-file* "ELEMENTS.NUMBR-small")
+(defparameter *elements-unnumbered-file* "ELEMENTS.UNNUM")
+(defparameter *elements-numbered-file* "ELEMENTS.NUMBR")
 (defparameter *accuracy* 1d-8) ; used in kepler-newton
 ;; astrodynamic parameters copied from
 ;; https://ssd.jpl.nasa.gov/astro_par.html
 (defparameter *ecliptic-obliquity* (* *rad* (* (/ 1d0 3600d0) 84381.448d0))) ; radians
 ;(defparameter *J2000* 2451545d0) ; days since TODO
 (defparameter *J2000* (local-time:encode-timestamp 0 0 0 1 1 1 2000)) ; J2000 timestamp
-
 (defparameter *au* 149597870700) ; meters
 
-;; Gaussian gravitational constant, not a constan anymore
+;; Gaussian gravitational constant, not a constant anymore
 ;; https://www.iau.org/static/resolutions/IAU2012_English.pdf
 (defparameter *k* 0.01720209895)
 
-;; useful stuff
-(defparameter *rad* (/ pi 180))
-(defparameter *deg* (/ 180 pi))
+;; functions to read the orbital elements
+(defun download-element-files-from-jpl ()
+  "Download the orbital elements from JPL"
+  (trivial-download:download "https://ssd.jpl.nasa.gov/dat/ELEMENTS.NUMBR" "ELEMENTS.NUMBR")
+  (trivial-download:download "https://ssd.jpl.nasa.gov/dat/ELEMENTS.UNNUM" "ELEMENTS.UNNUM"))
 
 (defun read-elements-format (format-string)
   "INPUT: second line of ELEMENTS.* file consisting of dashes and whitespaces.
@@ -49,6 +63,7 @@
    OUTPUT: list of elements as strings form elements-line"
   (read-element-line-rec format-list elements-line 0 ()))
 
+;; functions for orbital mechanics
 (defun kepler-newton (mean-anomaly excentricity excentric-anomaly-guessed accuracy)
   "INPUT: mean anomaly and a guessed excentric anomaly, given as radians
           excentricity
@@ -142,6 +157,27 @@
 			  0d0)
 		    '(3 1)))
   
+(defun julian-centuries-from-j2000 (timestamp)
+  "INPUT: timestamp as given by local-time package
+   OUTPUT: julian centuries since/before 1. Jan. 2000"
+  (/ (-
+      (local-time:astronomical-julian-date timestamp)
+      *J2000*)
+     36525d0))
+
+(defun degminsec2degdec (angle m s)
+  "converts angle given in degree,minutes and seconds to decimal degrees"
+  (+ angle (* (/ 1 60) m) (* (/ 1 3600) s)))
+
+(defun transform-ecliptic-to-equatorial (pos)
+  "INPUT: heliocentric ecliptic position
+   OUTPUT: hecliocentric equatorial position"
+  (magicl:@ (d1 *ecliptic-obliquity*) pos))
+
+(defun mean-daily-movement (a)
+  "INPUT: mean anomaly a in radians
+   OUTPUT: mean daily movement in radians"
+    (* *k* (sqrt (/ 1 (* a a a)))))
 
 (defun heliocentric-position (a e m node i w)
   "INPUT: semimajor axis a, excentricity e, mena anomaly m,
@@ -159,21 +195,19 @@
 	 (s1 (magicl:from-list (list (cos-true-anomaly e (excentric-anomaly e m)) (sin phi) 0) '(3 1))))
     (magicl:@ r0d3node d1i d3o s1)))
 
-(defun julian-centuries-from-j2000 (timestamp)
-  "INPUT: timestamp as given by local-time package
-   OUTPUT: julian centuries since/before 1. Jan. 2000"
-  (/ (-
-      (local-time:astronomical-julian-date timestamp)
-      *J2000*)
-     36525d0))
-
-(defun degminsec2degdec (angle m s)
-  "converts angle given in degree,minutes and seconds to decimal degrees"
-  (+ angle (* (/ 1 60) m) (* (/ 1 3600) s)))
+(defun heliocentric-position-at-date (a e m node i w epoch date)
+    "INPUT: semimajor axis a, excentricity e, mena anomaly m,
+          longitude of the ascending node node, inclination i,
+          argument of periapsis w, modified julian date
+          m, node, i and w in radians
+   OUTPUT: hecliocentric ecliptic cordinates at specified date"
+  (let* ((m0 (mod m (* 2 pi)))
+	 (m1 (+ m0(* (mean-daily-movement a) (- date epoch)))))
+	 (heliocentric-position a e m1 node i w)))
 
 ;; "class to store all the elements for an asteroid.
 ;;  unnumbered asteroids have identical name and id"
-(defclass asteroid-elements ()
+(defclass asteroid ()
   ((id :initarg :id :accessor id)
    (name :initarg :name :accessor name)
    (epoch :initarg :epoch :accessor epoch)
@@ -187,88 +221,25 @@
    (slope-parameter :initarg :g :accessor g)
    (ref :initarg :ref :accessor ref)))
 
-(defun parse-float (string)
-  "Return a float read from string, and the index to the remainder of string.
-   Stolen from Peter Norvig"
-  (multiple-value-bind (integer i)
-      (parse-integer string :junk-allowed t)
-    (multiple-value-bind (fraction j)
-	(parse-integer string :start (+ i 1) :junk-allowed t)
-      (values (float (+ integer (/ fraction (expt 10d0 (- j i 1))))) j))))
-
 (defun asteroid-mean-daily-movement (asteroid)
   "INPUT: asteroid object
    OUTPUT: mean daily movement in radians"
-  (let ((a (a asteroid)))
-    (* *k* (sqrt (/ 1 (* a a a))))))
-
-(defun mean-daily-movement (a)
-  "INPUT: mean anomaly a in radians
-   OUTPUT: mean daily movement in radians"
-    (* *k* (sqrt (/ 1 (* a a a)))))
-
-
-(defun heliocentric-position-at-date (a e m node i w epoch date)
-    "INPUT: semimajor axis a, excentricity e, mena anomaly m,
-          longitude of the ascending node node, inclination i,
-          argument of periapsis w, modified julian date
-          m, node, i and w in radians
-   OUTPUT: hecliocentric ecliptic cordinates at specified date"
-  (let* ((m0 (mod m (* 2 pi)))
-	 (m1 (+ m0(* (mean-daily-movement a) (- date epoch))))
-	 (phi (true-anomaly e m1))
-	 (r0 (distance-to-sun a e m1))
-	 (d3node (d3 node))
-	 (r0d3node (magicl:scale d3node r0))
-	 (d1i (d1 i))
-	 (d3o (d3 w))
-	 (s1 (magicl:from-list (list (cos-true-anomaly e (excentric-anomaly e m1))
-				     (sin phi)
-				     0)
-			       '(3 1))))
-    (magicl:@ r0d3node d1i d3o s1)))
+  (mean-daily-movement (a asteroid)))
 
 (defun asteroid-heliocentric-position (asteroid)
    "INPUT: asteroid object
     OUTPUT: hecliocentric ecliptic cordinates"
-  (let* ((a (a asteroid))
-	 (e (e asteroid))
-	 (m (m asteroid))
-	 (node (node asteroid))
-	 (i (i asteroid))
-	 (w (w asteroid))
-	 (phi (true-anomaly e m))
-	 (r0 (distance-to-sun a e m))
-	 (d3node (d3 node))
-	 (r0d3node (magicl:scale d3node r0))
-	 (d1i (d1 i))
-	 (d3w (d3 w))
-	 (s1 (magicl:from-list (list (cos-true-anomaly e (excentric-anomaly e m))
-				     (sin phi)
-				     0)
-			       '(3 1))))
-    (magicl:@ r0d3node d1i d3w s1)))
+  (heliocentric-position (a asteroid) (e asteroid)
+			 (m asteroid) (node asteroid)
+			 (i asteroid) (w asteroid)))
 
 (defun asteroid-heliocentric-position-at-date (asteroid date)
      "INPUT: asteroid object, modified julian date
       OUTPUT: hecliocentric ecliptic cordinates"
-  (let* ((a (a asteroid))
-	 (e (e asteroid))
-	 (m (+ (m asteroid) (* (asteroid-mean-daily-movement asteroid) (- date (epoch asteroid)))))
-	 (node (node asteroid))
-	 (i (i asteroid))
-	 (w (w asteroid))
-	 (phi (true-anomaly e m))
-	 (r0 (distance-to-sun a e m))
-	 (d3node (d3 node))
-	 (r0d3node (magicl:scale d3node r0))
-	 (d1i (d1 i))
-	 (d3w (d3 w))
-	 (s1 (magicl:from-list (list (cos-true-anomaly e (excentric-anomaly e m))
-				     (sin phi)
-				     0)
-			       '(3 1))))
-    (magicl:@ r0d3node d1i d3w s1)))
+  (heliocentric-position-at-date (a asteroid) (e asteroid)
+				 (m asteroid) (node asteroid)
+				 (i asteroid) (w asteroid)
+				 (epoch asteroid) date))
 
 (defun asteroid-from-numbered-elements-list (list)
   "INPUT: list of unnumbered asteroid orbital elements given by read element line
@@ -285,7 +256,7 @@
 	(absolute-magnitude (read-from-string (nth 9 list)))
 	(slope-parameter (read-from-string (nth 10 list)))
 	(ref (string-trim '(#\Space #\Tab) (nth 11 list))))
-    (make-instance 'asteroid-elements :id id :name name :epoch epoch
+    (make-instance 'asteroid :id id :name name :epoch epoch
 				      :a semi-major-axis :e excentricity 
 				      :i inclination :w argument-of-perihelion
 				      :node longitude-of-ascending-node :m mean-anomaly 
@@ -306,7 +277,7 @@
 	 (absolute-magnitude (read-from-string (nth 8 list)))
 	 (slope-parameter (read-from-string (nth 9 list)))
 	 (ref (string-trim '(#\Space #\Tab) (nth 10 list))))
-    (make-instance 'asteroid-elements :id id :name name :epoch epoch
+    (make-instance 'asteroid :id id :name name :epoch epoch
 				      :a semi-major-axis :e excentricity 
 				      :i inclination :w argument-of-perihelion
 				      :node longitude-of-ascending-node :m mean-anomaly 
@@ -327,10 +298,10 @@
 	 (key (position-key pos)))
     (setf (gethash key hashtable) (cons pos (gethash key hashtable)))))
 	
-(defun read-elements-numbered (elements-file)
+(defun read-elements-numbered ()
   "INPUT: file with numbered elements from https://ssd.jpl.nasa.gov/dat/ELEMENTS.NUMBR
    OUTPUT: list of asteroid elements"
-  (with-open-file (in elements-file)
+  (with-open-file (in *elements-numbered-file*)
     (read-line in)
     (let* ((format-string (read-line in))
 	   (format-list (read-elements-format format-string)))
@@ -338,10 +309,10 @@
             while line
             collect (asteroid-from-numbered-elements-list (read-element-line format-list line))))))
 
-(defun read-elements-unnumbered (elements-file)
+(defun read-elements-unnumbered ()
     "INPUT: file with numbered elements from https://ssd.jpl.nasa.gov/dat/ELEMENTS.UNNUM
      OUTPUT: list of asteroid objects"
-  (with-open-file (in elements-file)
+  (with-open-file (in *elements-unnumbered-file*)
     (read-line in)
     (let* ((format-string (read-line in))
 	   (format-list (read-elements-format format-string)))
@@ -354,11 +325,6 @@
    OUTPUT: fills hashtable with the asteroid objects"
   (dolist (asteroid asteroid-list)
     (asteroid-hash asteroid hashtable)))
-
-(defun transform-ecliptic-to-equatorial (pos)
-  "INPUT: heliocentric ecliptic position
-   OUTPUT: hecliocentric equatorial position"
-  (magicl:@ (d1 *ecliptic-obliquity*) pos))
 
 (defun unpack-magicl-position (pos)
   (list (magicl:tref pos 0 0) (magicl:tref pos 1 0) (magicl:tref pos 2 0)))
